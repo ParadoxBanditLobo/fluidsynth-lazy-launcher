@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+
+# FluidSynth Lazy Launcher
+# A small terminal menu for playing and rendering MIDI files with SoundFonts.
+
+set -u
+
+APP_NAME="FluidSynth Lazy Launcher"
+VERSION="1.1.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fluidsynth-lazy-launcher"
+CONFIG_FILE="$CONFIG_DIR/config"
+LOG_FILE="$CONFIG_DIR/fluidsynth.log"
+
+MIDI_DIR=""
+SOUNDFONT_DIR=""
+OUTPUT_DIR=""
+SELECTED_MIDI=""
+SELECTED_SOUNDFONT=""
+PLAYER_PID=""
+CHOSEN_PATH=""
+CHOSEN_FILE=""
+
+pause() {
+    printf '\nPress Enter to continue...'
+    IFS= read -r _
+}
+
+clear_screen() {
+    if command -v clear >/dev/null 2>&1 && [[ -t 1 ]]; then
+        clear
+    else
+        printf '\n'
+    fi
+}
+
+expand_path() {
+    local path="$1"
+    case "$path" in
+        "~") printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s/%s\n' "$HOME" "${path#~/}" ;;
+        *) printf '%s\n' "$path" ;;
+    esac
+}
+
+absolute_existing_dir() {
+    local path
+    path="$(expand_path "$1")"
+    (cd "$path" 2>/dev/null && pwd -P)
+}
+
+absolute_output_dir() {
+    local path
+    path="$(expand_path "$1")"
+    mkdir -p "$path" 2>/dev/null || return 1
+    (cd "$path" 2>/dev/null && pwd -P)
+}
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            MIDI_DIR) MIDI_DIR="$value" ;;
+            SOUNDFONT_DIR) SOUNDFONT_DIR="$value" ;;
+            OUTPUT_DIR) OUTPUT_DIR="$value" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    {
+        printf 'MIDI_DIR=%s\n' "$MIDI_DIR"
+        printf 'SOUNDFONT_DIR=%s\n' "$SOUNDFONT_DIR"
+        printf 'OUTPUT_DIR=%s\n' "$OUTPUT_DIR"
+    } > "$CONFIG_FILE"
+}
+
+check_dependencies() {
+    if ! command -v fluidsynth >/dev/null 2>&1; then
+        printf '%s\n' "Error: FluidSynth is not installed or is not in PATH."
+        printf '%s\n' "Install the 'fluidsynth' package, then run this launcher again."
+        exit 1
+    fi
+}
+
+prompt_existing_dir() {
+    local label="$1"
+    local current="$2"
+    local entered resolved
+
+    while true; do
+        printf '%s' "$label"
+        [[ -n "$current" ]] && printf ' [%s]' "$current"
+        printf ': '
+        IFS= read -r entered
+        [[ -z "$entered" ]] && entered="$current"
+
+        if [[ -z "$entered" ]]; then
+            printf 'A folder is required.\n'
+            continue
+        fi
+
+        if resolved="$(absolute_existing_dir "$entered")"; then
+            CHOSEN_PATH="$resolved"
+            return 0
+        fi
+
+        printf 'Folder not found: %s\n' "$entered"
+    done
+}
+
+prompt_output_dir() {
+    local label="$1"
+    local current="$2"
+    local entered resolved
+
+    while true; do
+        printf '%s' "$label"
+        [[ -n "$current" ]] && printf ' [%s]' "$current"
+        printf ': '
+        IFS= read -r entered
+        [[ -z "$entered" ]] && entered="$current"
+
+        if [[ -z "$entered" ]]; then
+            printf 'A folder is required.\n'
+            continue
+        fi
+
+        if resolved="$(absolute_output_dir "$entered")"; then
+            CHOSEN_PATH="$resolved"
+            return 0
+        fi
+
+        printf 'Could not create or access: %s\n' "$entered"
+    done
+}
+
+configure_folders() {
+    clear_screen
+    printf '%s\n\n' "$APP_NAME - Folder Setup"
+
+    prompt_existing_dir 'MIDI folder' "$MIDI_DIR"
+    MIDI_DIR="$CHOSEN_PATH"
+    prompt_existing_dir 'SoundFont folder' "$SOUNDFONT_DIR"
+    SOUNDFONT_DIR="$CHOSEN_PATH"
+    prompt_output_dir 'Output folder' "$OUTPUT_DIR"
+    OUTPUT_DIR="$CHOSEN_PATH"
+
+    save_config
+}
+
+folders_are_valid() {
+    [[ -d "$MIDI_DIR" && -d "$SOUNDFONT_DIR" && -d "$OUTPUT_DIR" ]]
+}
+
+relative_name() {
+    local full="$1"
+    local root="$2"
+    printf '%s\n' "${full#"$root"/}"
+}
+
+choose_file() {
+    local kind="$1"
+    local root="$2"
+    shift 2
+    local -a extensions=("$@")
+    local filter choice i file ext lower_file lower_filter
+    local -a all_files=()
+    local -a shown_files=()
+
+    while IFS= read -r -d '' file; do
+        all_files+=("$file")
+    done < <(find "$root" -type f -print0 2>/dev/null)
+
+    for file in "${all_files[@]}"; do
+        lower_file="${file,,}"
+        for ext in "${extensions[@]}"; do
+            if [[ "$lower_file" == *".${ext,,}" ]]; then
+                shown_files+=("$file")
+                break
+            fi
+        done
+    done
+
+    if ((${#shown_files[@]} == 0)); then
+        printf 'No %s files found in:\n%s\n' "$kind" "$root"
+        pause
+        return 1
+    fi
+
+    printf 'Filter by name (blank shows all): '
+    IFS= read -r filter
+
+    if [[ -n "$filter" ]]; then
+        lower_filter="${filter,,}"
+        all_files=("${shown_files[@]}")
+        shown_files=()
+        for file in "${all_files[@]}"; do
+            if [[ "${file,,}" == *"$lower_filter"* ]]; then
+                shown_files+=("$file")
+            fi
+        done
+    fi
+
+    if ((${#shown_files[@]} == 0)); then
+        printf 'No matching %s files.\n' "$kind"
+        pause
+        return 1
+    fi
+
+    printf '\n'
+    for ((i = 0; i < ${#shown_files[@]}; i++)); do
+        printf '%3d. %s\n' "$((i + 1))" "$(relative_name "${shown_files[$i]}" "$root")"
+    done
+    printf '  0. Cancel\n\n'
+
+    while true; do
+        printf 'Choose %s: ' "$kind"
+        IFS= read -r choice
+
+        if [[ "$choice" == "0" ]]; then
+            return 1
+        fi
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#shown_files[@]})); then
+            CHOSEN_FILE="${shown_files[$((choice - 1))]}"
+            return 0
+        fi
+
+        printf 'Invalid selection.\n'
+    done
+}
+
+select_midi() {
+    clear_screen
+    printf 'Select MIDI\n\n'
+    if choose_file 'MIDI' "$MIDI_DIR" mid midi; then
+        SELECTED_MIDI="$CHOSEN_FILE"
+    fi
+}
+
+select_soundfont() {
+    clear_screen
+    printf 'Select SoundFont\n\n'
+    if choose_file 'SoundFont' "$SOUNDFONT_DIR" sf2 sf3; then
+        SELECTED_SOUNDFONT="$CHOSEN_FILE"
+    fi
+}
+
+player_is_running() {
+    local _pid _comm state _rest
+
+    [[ -n "$PLAYER_PID" ]] || return 1
+    if ! kill -0 "$PLAYER_PID" 2>/dev/null; then
+        wait "$PLAYER_PID" 2>/dev/null || true
+        PLAYER_PID=""
+        return 1
+    fi
+
+    # A completed background process can remain briefly as a zombie until reaped.
+    if [[ -r "/proc/$PLAYER_PID/stat" ]]; then
+        read -r _pid _comm state _rest < "/proc/$PLAYER_PID/stat" || true
+        if [[ "$state" == "Z" ]]; then
+            wait "$PLAYER_PID" 2>/dev/null || true
+            PLAYER_PID=""
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+stop_playback() {
+    if player_is_running; then
+        kill "$PLAYER_PID" 2>/dev/null || true
+        wait "$PLAYER_PID" 2>/dev/null || true
+        PLAYER_PID=""
+        printf 'Playback stopped.\n'
+    else
+        PLAYER_PID=""
+        printf 'Nothing is currently playing.\n'
+    fi
+}
+
+require_selection() {
+    if [[ -z "$SELECTED_MIDI" || ! -f "$SELECTED_MIDI" ]]; then
+        printf 'Choose a MIDI file first.\n'
+        return 1
+    fi
+    if [[ -z "$SELECTED_SOUNDFONT" || ! -f "$SELECTED_SOUNDFONT" ]]; then
+        printf 'Choose a SoundFont first.\n'
+        return 1
+    fi
+}
+
+play_selected() {
+    require_selection || { pause; return; }
+
+    if player_is_running; then
+        kill "$PLAYER_PID" 2>/dev/null || true
+        wait "$PLAYER_PID" 2>/dev/null || true
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    : > "$LOG_FILE"
+
+    fluidsynth -ni "$SELECTED_SOUNDFONT" "$SELECTED_MIDI" >"$LOG_FILE" 2>&1 &
+    PLAYER_PID=$!
+
+    sleep 0.2
+    if player_is_running; then
+        printf 'Playing: %s\n' "$(basename "$SELECTED_MIDI")"
+        printf 'SoundFont: %s\n' "$(basename "$SELECTED_SOUNDFONT")"
+    else
+        wait "$PLAYER_PID" 2>/dev/null || true
+        PLAYER_PID=""
+        printf 'FluidSynth could not start playback.\n'
+        printf 'Log: %s\n' "$LOG_FILE"
+    fi
+    pause
+}
+
+safe_stem() {
+    local name="$1"
+    name="${name%.*}"
+    name="${name//\//_}"
+    printf '%s\n' "$name"
+}
+
+unique_output_path() {
+    local base="$1"
+    local extension="$2"
+    local candidate="$OUTPUT_DIR/$base.$extension"
+    local counter=2
+
+    while [[ -e "$candidate" ]]; do
+        candidate="$OUTPUT_DIR/$base ($counter).$extension"
+        ((counter++))
+    done
+
+    printf '%s\n' "$candidate"
+}
+
+render_selected() {
+    local midi_stem sf_stem output status
+    require_selection || { pause; return; }
+
+    midi_stem="$(safe_stem "$(basename "$SELECTED_MIDI")")"
+    sf_stem="$(safe_stem "$(basename "$SELECTED_SOUNDFONT")")"
+    output="$(unique_output_path "$midi_stem - $sf_stem" wav)"
+
+    clear_screen
+    printf 'Rendering:\n  MIDI: %s\n  SoundFont: %s\n  Output: %s\n\n' \
+        "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$output"
+
+    fluidsynth -ni -T wav -F "$output" "$SELECTED_SOUNDFONT" "$SELECTED_MIDI"
+    status=$?
+
+    if ((status == 0)) && [[ -s "$output" ]]; then
+        printf '\nFinished: %s\n' "$output"
+    else
+        rm -f "$output"
+        printf '\nRender failed with exit code %d.\n' "$status"
+    fi
+    pause
+}
+
+render_selected_mp3() {
+    local midi_stem sf_stem output temp_dir temp_wav render_status encode_status
+    require_selection || { pause; return; }
+
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        printf 'MP3 export requires FFmpeg. Install the ffmpeg package first.\n'
+        pause
+        return
+    fi
+
+    midi_stem="$(safe_stem "$(basename "$SELECTED_MIDI")")"
+    sf_stem="$(safe_stem "$(basename "$SELECTED_SOUNDFONT")")"
+    output="$(unique_output_path "$midi_stem - $sf_stem" mp3)"
+    temp_dir="$(mktemp -d "$OUTPUT_DIR/.fluidsynth-render-XXXXXX")" || {
+        printf 'Could not create a temporary render folder.\n'
+        pause
+        return
+    }
+    temp_wav="$temp_dir/render.wav"
+
+    clear_screen
+    printf 'Rendering MP3:\n  MIDI: %s\n  SoundFont: %s\n  Output: %s\n\n' \
+        "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$output"
+
+    fluidsynth -ni -T wav -F "$temp_wav" "$SELECTED_SOUNDFONT" "$SELECTED_MIDI"
+    render_status=$?
+
+    if ((render_status != 0)) || [[ ! -s "$temp_wav" ]]; then
+        rm -rf "$temp_dir"
+        rm -f "$output"
+        printf '\nFluidSynth render failed with exit code %d.\n' "$render_status"
+        pause
+        return
+    fi
+
+    ffmpeg -hide_banner -loglevel error -y -i "$temp_wav" -codec:a libmp3lame -q:a 2 "$output"
+    encode_status=$?
+    rm -rf "$temp_dir"
+
+    if ((encode_status == 0)) && [[ -s "$output" ]]; then
+        printf '\nFinished: %s\n' "$output"
+    else
+        rm -f "$output"
+        printf '\nMP3 conversion failed with exit code %d.\n' "$encode_status"
+    fi
+    pause
+}
+
+choose_random_midi() {
+    local -a files=()
+    local file lower
+
+    while IFS= read -r -d '' file; do
+        lower="${file,,}"
+        if [[ "$lower" == *.mid || "$lower" == *.midi ]]; then
+            files+=("$file")
+        fi
+    done < <(find "$MIDI_DIR" -type f -print0 2>/dev/null)
+
+    if ((${#files[@]} == 0)); then
+        printf 'No MIDI files found.\n'
+        pause
+        return
+    fi
+
+    SELECTED_MIDI="${files[RANDOM % ${#files[@]}]}"
+    printf 'Random MIDI selected: %s\n' "$(relative_name "$SELECTED_MIDI" "$MIDI_DIR")"
+    pause
+}
+
+show_status() {
+    local playback="Stopped"
+    player_is_running && playback="Playing"
+
+    printf 'MIDI folder:      %s\n' "$MIDI_DIR"
+    printf 'SoundFont folder: %s\n' "$SOUNDFONT_DIR"
+    printf 'Output folder:    %s\n' "$OUTPUT_DIR"
+    printf '\nSelected MIDI:      %s\n' "${SELECTED_MIDI:-None}"
+    printf 'Selected SoundFont: %s\n' "${SELECTED_SOUNDFONT:-None}"
+    printf 'Playback:           %s\n' "$playback"
+}
+
+cleanup() {
+    if player_is_running; then
+        kill "$PLAYER_PID" 2>/dev/null || true
+        wait "$PLAYER_PID" 2>/dev/null || true
+    fi
+}
+
+main_menu() {
+    local choice
+
+    while true; do
+        clear_screen
+        printf '%s v%s\n' "$APP_NAME" "$VERSION"
+        printf '%s\n\n' "=========================="
+        show_status
+        printf '\n'
+        printf '1. Choose MIDI\n'
+        printf '2. Choose SoundFont\n'
+        printf '3. Play selected MIDI\n'
+        printf '4. Stop playback\n'
+        printf '5. Render selected MIDI to WAV\n'
+        printf '6. Render selected MIDI to MP3\n'
+        printf '7. Choose a random MIDI\n'
+        printf '8. Change folders\n'
+        printf '9. Exit\n\n'
+        printf 'Choose an option: '
+        IFS= read -r choice
+
+        case "$choice" in
+            1) select_midi ;;
+            2) select_soundfont ;;
+            3) play_selected ;;
+            4) stop_playback; pause ;;
+            5) render_selected ;;
+            6) render_selected_mp3 ;;
+            7) choose_random_midi ;;
+            8) configure_folders ;;
+            9) break ;;
+            *) printf 'Invalid option.\n'; pause ;;
+        esac
+    done
+}
+
+main() {
+    if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+        printf "%s v%s\n" "$APP_NAME" "$VERSION"
+        return 0
+    fi
+
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    check_dependencies
+    load_config
+
+    if ! folders_are_valid; then
+        configure_folders
+    fi
+
+    main_menu
+}
+
+main "$@"
