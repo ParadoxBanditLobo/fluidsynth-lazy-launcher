@@ -12,6 +12,7 @@ CONFIG_FILE="$CONFIG_DIR/config"
 LOG_FILE="$CONFIG_DIR/fluidsynth.log"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MIDI_TOOL="$SCRIPT_DIR/midi-tools.py"
+SF2_BUILDER="$SCRIPT_DIR/sf2-builder.py"
 MIDI_SPEED="1.00"
 PLAYBACK_MIDI=""
 PREPARED_MIDI=""
@@ -108,6 +109,10 @@ check_dependencies() {
     fi
     if [[ ! -f "$MIDI_TOOL" ]]; then
         printf 'Error: MIDI helper not found: %s\n' "$MIDI_TOOL"
+        exit 1
+    fi
+    if [[ ! -f "$SF2_BUILDER" ]]; then
+        printf 'Error: SoundFont builder helper not found: %s\n' "$SF2_BUILDER"
         exit 1
     fi
 }
@@ -474,6 +479,21 @@ prepare_mapped_midi() {
     return 0
 }
 
+
+soundfont_builder() {
+    local result_file="$CONFIG_DIR/sf2-builder-result"
+    mkdir -p "$CONFIG_DIR"
+    rm -f "$result_file"
+    clear_screen
+    python3 "$SF2_BUILDER" interactive "$OUTPUT_DIR" \
+        --slot-a "$SOUNDFONT_A" --slot-b "$SOUNDFONT_B" --slot-c "$SOUNDFONT_C" \
+        --result-file "$result_file"
+    if [[ -s "$result_file" ]]; then
+        printf '\nCustom SoundFont created:\n%s\n' "$(cat "$result_file")"
+    fi
+    pause
+}
+
 player_is_running() {
     local _pid _comm state _rest
 
@@ -740,7 +760,8 @@ main_menu() {
         printf '10. Inspect selected MIDI\n'
         printf '11. Change MIDI speed\n'
         printf '12. Reassign MIDI instruments\n'
-        printf '13. Exit\n\n'
+        printf '13. Build custom SoundFont\n'
+        printf '14. Exit\n\n'
         printf 'Choose an option: '
         IFS= read -r choice
 
@@ -757,7 +778,8 @@ main_menu() {
             10) inspect_selected_midi ;;
             11) set_midi_speed ;;
             12) instrument_reassignment ;;
-            13) break ;;
+            13) soundfont_builder ;;
+            14) break ;;
             *) printf 'Invalid option.\n'; pause ;;
         esac
     done
