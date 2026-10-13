@@ -305,7 +305,7 @@ browse_soundfont_slot() {
         printf '\nPreset number to preview (0 returns): '; IFS= read -r choice
         [[ "$choice" == 0 ]] && return
         if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= count)); then
-            read -r bank program name <<< "$(sed -n "\${choice}p" <<< "$presets")"
+            read -r bank program name <<< "$(sed -n "${choice}p" <<< "$presets")"
             preview_soundfont_preset "$sf" "$((10#$bank))" "$((10#$program))"
         else printf 'Invalid selection.\n'; pause; fi
     done
@@ -315,14 +315,14 @@ soundfont_workspace() {
     while true; do
         clear_screen
         printf 'SoundFont Workspace\n===================\n\n'
-        printf 'A: %s\nB: %s\nC: %s\n\n' "\${SOUNDFONT_A:-Empty}" "\${SOUNDFONT_B:-Empty}" "\${SOUNDFONT_C:-Empty}"
+        printf 'A: %s\nB: %s\nC: %s\n\n' "${SOUNDFONT_A:-Empty}" "${SOUNDFONT_B:-Empty}" "${SOUNDFONT_C:-Empty}"
         printf '1. Load/replace slot A\n2. Load/replace slot B\n3. Load/replace slot C\n'
         printf '4. Browse/preview slot A\n5. Browse/preview slot B\n6. Browse/preview slot C\n'
         printf '7. Unload a slot\n8. Back\n\nChoose an option: '; IFS= read -r choice
         case "$choice" in
             1|2|3) case "$choice" in 1) slot=A ;; 2) slot=B ;; 3) slot=C ;; esac; choose_soundfont_for_slot "$slot"; pause ;;
             4) browse_soundfont_slot A ;; 5) browse_soundfont_slot B ;; 6) browse_soundfont_slot C ;;
-            7) printf 'Unload slot (A/B/C): '; IFS= read -r slot; slot="\${slot^^}"
+            7) printf 'Unload slot (A/B/C): '; IFS= read -r slot; slot="${slot^^}"
                if [[ "$slot" == A || "$slot" == B || "$slot" == C ]]; then
                    current="$(soundfont_slot_value "$slot")"; set_soundfont_slot "$slot" ""
                    [[ "$SELECTED_SOUNDFONT" == "$current" ]] && SELECTED_SOUNDFONT=""
