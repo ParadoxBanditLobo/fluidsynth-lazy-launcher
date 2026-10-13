@@ -454,9 +454,16 @@ def prepare_playback(midi,target,selected_sf):
     assignments=data.get('assignments',[])
     if not assignments:
         print('plain'); print(midi); print(selected_sf); return
-    help_text=subprocess.run(['fluidsynth','--help'],text=True,capture_output=True).stdout
+    proc=subprocess.run(['fluidsynth','--help'],text=True,capture_output=True)
+    help_text=proc.stdout+proc.stderr
     if '--bank-offset' not in help_text:
-        raise ValueError('Mapped multi-SoundFont playback requires FluidSynth 2.5.0 or newer')
+        slots={a.get('slot') for a in assignments}
+        if len(slots)==1:
+            slot=next(iter(slots))
+            sf=next((a.get('soundfont','') for a in assignments if a.get('slot')==slot), '')
+            if sf and Path(sf).is_file():
+                print('plain'); print(midi); print(sf); return
+        raise ValueError('Multi-SoundFont playback requires FluidSynth 2.5.0 or newer')
     apply_assignments(midi,target,assignments,offsets=True)
     print('mapped'); print(target)
     if selected_sf and Path(selected_sf).is_file():
