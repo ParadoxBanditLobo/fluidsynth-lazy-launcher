@@ -6,7 +6,7 @@
 set -u
 
 APP_NAME="FluidSynth Lazy Launcher"
-VERSION="1.1.0"
+VERSION="1.2.0-dev"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fluidsynth-lazy-launcher"
 CONFIG_FILE="$CONFIG_DIR/config"
 LOG_FILE="$CONFIG_DIR/fluidsynth.log"
@@ -16,6 +16,9 @@ SOUNDFONT_DIR=""
 OUTPUT_DIR=""
 SELECTED_MIDI=""
 SELECTED_SOUNDFONT=""
+SOUNDFONT_A=""
+SOUNDFONT_B=""
+SOUNDFONT_C=""
 PLAYER_PID=""
 CHOSEN_PATH=""
 CHOSEN_FILE=""
@@ -64,6 +67,9 @@ load_config() {
             MIDI_DIR) MIDI_DIR="$value" ;;
             SOUNDFONT_DIR) SOUNDFONT_DIR="$value" ;;
             OUTPUT_DIR) OUTPUT_DIR="$value" ;;
+            SOUNDFONT_A) SOUNDFONT_A="$value" ;;
+            SOUNDFONT_B) SOUNDFONT_B="$value" ;;
+            SOUNDFONT_C) SOUNDFONT_C="$value" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -74,6 +80,9 @@ save_config() {
         printf 'MIDI_DIR=%s\n' "$MIDI_DIR"
         printf 'SOUNDFONT_DIR=%s\n' "$SOUNDFONT_DIR"
         printf 'OUTPUT_DIR=%s\n' "$OUTPUT_DIR"
+        printf 'SOUNDFONT_A=%s\n' "$SOUNDFONT_A"
+        printf 'SOUNDFONT_B=%s\n' "$SOUNDFONT_B"
+        printf 'SOUNDFONT_C=%s\n' "$SOUNDFONT_C"
     } > "$CONFIG_FILE"
 }
 
@@ -247,6 +256,81 @@ select_soundfont() {
     if choose_file 'SoundFont' "$SOUNDFONT_DIR" sf2 sf3; then
         SELECTED_SOUNDFONT="$CHOSEN_FILE"
     fi
+}
+
+
+soundfont_slot_value() {
+    case "$1" in A) printf '%s\n' "$SOUNDFONT_A" ;; B) printf '%s\n' "$SOUNDFONT_B" ;; C) printf '%s\n' "$SOUNDFONT_C" ;; esac
+}
+set_soundfont_slot() {
+    case "$1" in A) SOUNDFONT_A="$2" ;; B) SOUNDFONT_B="$2" ;; C) SOUNDFONT_C="$2" ;; esac
+    save_config
+}
+choose_soundfont_for_slot() {
+    local slot="$1"
+    if choose_file 'SoundFont' "$SOUNDFONT_DIR" sf2 sf3; then
+        set_soundfont_slot "$slot" "$CHOSEN_FILE"
+        SELECTED_SOUNDFONT="$CHOSEN_FILE"
+        printf 'Loaded slot %s: %s\n' "$slot" "$(basename "$CHOSEN_FILE")"
+    fi
+}
+list_soundfont_presets() {
+    local sf="$1"
+    [[ -f "$sf" ]] || return 1
+    { printf 'inst 1\n'; printf 'quit\n'; } | fluidsynth -ni "$sf" 2>/dev/null |
+        sed -nE 's/^[[:space:]]*([0-9]{3})-([0-9]{3})[[:space:]]+(.+)$/\1 \2 \3/p'
+}
+preview_soundfont_preset() {
+    local sf="$1" bank="$2" program="$3"
+    printf 'Previewing bank %d, program %d...\n' "$bank" "$program"
+    { printf 'select 0 1 %d %d\n' "$bank" "$program"; printf 'noteon 0 60 96\n'; sleep 0.25;
+      printf 'noteon 0 64 90\n'; sleep 0.25; printf 'noteon 0 67 90\n'; sleep 0.65;
+      printf 'noteoff 0 60\nnoteoff 0 64\nnoteoff 0 67\nquit\n'; } |
+        fluidsynth -ni "$sf" >/dev/null 2>&1
+}
+browse_soundfont_slot() {
+    local slot="$1" sf presets choice bank program name count
+    sf="$(soundfont_slot_value "$slot")"
+    [[ -n "$sf" && -f "$sf" ]] || { printf 'Slot %s is empty.\n' "$slot"; pause; return; }
+    presets="$(list_soundfont_presets "$sf")"
+    [[ -n "$presets" ]] || { printf 'No presets could be read.\n'; pause; return; }
+    while true; do
+        clear_screen
+        printf 'SoundFont %s: %s\n\n' "$slot" "$(basename "$sf")"
+        printf ' #   BANK PROG  PRESET\n%s\n' '------------------------------'
+        count=0
+        while read -r bank program name; do
+            ((count++)); printf '%3d  %3d  %3d  %s\n' "$count" "$((10#$bank))" "$((10#$program))" "$name"
+        done <<< "$presets"
+        printf '\nPreset number to preview (0 returns): '; IFS= read -r choice
+        [[ "$choice" == 0 ]] && return
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= count)); then
+            read -r bank program name <<< "$(sed -n "\${choice}p" <<< "$presets")"
+            preview_soundfont_preset "$sf" "$((10#$bank))" "$((10#$program))"
+        else printf 'Invalid selection.\n'; pause; fi
+    done
+}
+soundfont_workspace() {
+    local choice slot current
+    while true; do
+        clear_screen
+        printf 'SoundFont Workspace\n===================\n\n'
+        printf 'A: %s\nB: %s\nC: %s\n\n' "\${SOUNDFONT_A:-Empty}" "\${SOUNDFONT_B:-Empty}" "\${SOUNDFONT_C:-Empty}"
+        printf '1. Load/replace slot A\n2. Load/replace slot B\n3. Load/replace slot C\n'
+        printf '4. Browse/preview slot A\n5. Browse/preview slot B\n6. Browse/preview slot C\n'
+        printf '7. Unload a slot\n8. Back\n\nChoose an option: '; IFS= read -r choice
+        case "$choice" in
+            1|2|3) case "$choice" in 1) slot=A ;; 2) slot=B ;; 3) slot=C ;; esac; choose_soundfont_for_slot "$slot"; pause ;;
+            4) browse_soundfont_slot A ;; 5) browse_soundfont_slot B ;; 6) browse_soundfont_slot C ;;
+            7) printf 'Unload slot (A/B/C): '; IFS= read -r slot; slot="\${slot^^}"
+               if [[ "$slot" == A || "$slot" == B || "$slot" == C ]]; then
+                   current="$(soundfont_slot_value "$slot")"; set_soundfont_slot "$slot" ""
+                   [[ "$SELECTED_SOUNDFONT" == "$current" ]] && SELECTED_SOUNDFONT=""
+                   printf 'Slot %s unloaded.\n' "$slot"
+               else printf 'Invalid slot.\n'; fi; pause ;;
+            8) return ;; *) printf 'Invalid option.\n'; pause ;;
+        esac
+    done
 }
 
 player_is_running() {
@@ -446,6 +530,7 @@ show_status() {
     printf 'Output folder:    %s\n' "$OUTPUT_DIR"
     printf '\nSelected MIDI:      %s\n' "${SELECTED_MIDI:-None}"
     printf 'Selected SoundFont: %s\n' "${SELECTED_SOUNDFONT:-None}"
+    printf 'SoundFont slots:   A=%s | B=%s | C=%s\n' "${SOUNDFONT_A:+Loaded}" "${SOUNDFONT_B:+Loaded}" "${SOUNDFONT_C:+Loaded}"
     printf 'Playback:           %s\n' "$playback"
 }
 
@@ -473,7 +558,8 @@ main_menu() {
         printf '6. Render selected MIDI to MP3\n'
         printf '7. Choose a random MIDI\n'
         printf '8. Change folders\n'
-        printf '9. Exit\n\n'
+        printf '9. SoundFont workspace\n'
+        printf '10. Exit\n\n'
         printf 'Choose an option: '
         IFS= read -r choice
 
@@ -486,7 +572,8 @@ main_menu() {
             6) render_selected_mp3 ;;
             7) choose_random_midi ;;
             8) configure_folders ;;
-            9) break ;;
+            9) soundfont_workspace ;;
+            10) break ;;
             *) printf 'Invalid option.\n'; pause ;;
         esac
     done
