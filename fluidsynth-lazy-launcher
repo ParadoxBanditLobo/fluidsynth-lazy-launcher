@@ -10,6 +10,10 @@ VERSION="1.2.0-dev"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fluidsynth-lazy-launcher"
 CONFIG_FILE="$CONFIG_DIR/config"
 LOG_FILE="$CONFIG_DIR/fluidsynth.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MIDI_TOOL="$SCRIPT_DIR/midi-tools.py"
+MIDI_SPEED="1.00"
+PLAYBACK_MIDI=""
 
 MIDI_DIR=""
 SOUNDFONT_DIR=""
@@ -70,6 +74,7 @@ load_config() {
             SOUNDFONT_A) SOUNDFONT_A="$value" ;;
             SOUNDFONT_B) SOUNDFONT_B="$value" ;;
             SOUNDFONT_C) SOUNDFONT_C="$value" ;;
+            MIDI_SPEED) MIDI_SPEED="$value" ;;
         esac
     done < "$CONFIG_FILE"
 }
@@ -83,6 +88,7 @@ save_config() {
         printf 'SOUNDFONT_A=%s\n' "$SOUNDFONT_A"
         printf 'SOUNDFONT_B=%s\n' "$SOUNDFONT_B"
         printf 'SOUNDFONT_C=%s\n' "$SOUNDFONT_C"
+        printf 'MIDI_SPEED=%s\n' "$MIDI_SPEED"
     } > "$CONFIG_FILE"
 }
 
@@ -90,6 +96,14 @@ check_dependencies() {
     if ! command -v fluidsynth >/dev/null 2>&1; then
         printf '%s\n' "Error: FluidSynth is not installed or is not in PATH."
         printf '%s\n' "Install the 'fluidsynth' package, then run this launcher again."
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "Error: Python 3 is required for MIDI inspection and tempo control."
+        exit 1
+    fi
+    if [[ ! -f "$MIDI_TOOL" ]]; then
+        printf 'Error: MIDI helper not found: %s\n' "$MIDI_TOOL"
         exit 1
     fi
 }
@@ -351,6 +365,81 @@ soundfont_workspace() {
     done
 }
 
+
+require_midi() {
+    if [[ -z "$SELECTED_MIDI" || ! -f "$SELECTED_MIDI" ]]; then
+        printf 'Choose a MIDI file first.\n'
+        return 1
+    fi
+}
+
+inspect_selected_midi() {
+    require_midi || { pause; return; }
+    clear_screen
+    printf 'MIDI Inspector\n==============\n\n'
+    printf 'File: %s\n\n' "$SELECTED_MIDI"
+    python3 "$MIDI_TOOL" inspect "$SELECTED_MIDI"
+    pause
+}
+
+set_midi_speed() {
+    local choice entered
+    clear_screen
+    printf 'MIDI Playback Speed\n===================\n\n'
+    printf 'Current speed: %sx\n\n' "$MIDI_SPEED"
+    printf '1. 0.50x\n2. 0.75x\n3. 1.00x\n4. 1.25x\n5. 1.50x\n6. 2.00x\n7. Custom\n8. Cancel\n\n'
+    printf 'Choose an option: '
+    IFS= read -r choice
+    case "$choice" in
+        1) MIDI_SPEED="0.50" ;;
+        2) MIDI_SPEED="0.75" ;;
+        3) MIDI_SPEED="1.00" ;;
+        4) MIDI_SPEED="1.25" ;;
+        5) MIDI_SPEED="1.50" ;;
+        6) MIDI_SPEED="2.00" ;;
+        7)
+            printf 'Enter multiplier (0.05 to 8.0): '
+            IFS= read -r entered
+            if python3 - "$entered" <<'PY'
+import sys
+try:
+    v=float(sys.argv[1])
+    raise SystemExit(0 if 0.05 <= v <= 8.0 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+            then
+                MIDI_SPEED="$entered"
+            else
+                printf 'Invalid speed.\n'
+                pause
+                return
+            fi
+            ;;
+        8) return ;;
+        *) printf 'Invalid option.\n'; pause; return ;;
+    esac
+    save_config
+    printf 'Playback speed set to %sx.\n' "$MIDI_SPEED"
+    pause
+}
+
+prepare_speed_midi() {
+    local source="$1" target="$2"
+    if [[ "$MIDI_SPEED" == "1" || "$MIDI_SPEED" == "1.0" || "$MIDI_SPEED" == "1.00" ]]; then
+        printf '%s\n' "$source"
+        return 0
+    fi
+    mkdir -p "$CONFIG_DIR"
+    rm -f "$target"
+    if python3 "$MIDI_TOOL" speed "$source" "$target" "$MIDI_SPEED" >/dev/null; then
+        printf '%s\n' "$target"
+        return 0
+    fi
+    rm -f "$target"
+    return 1
+}
+
 player_is_running() {
     local _pid _comm state _rest
 
@@ -408,13 +497,20 @@ play_selected() {
     mkdir -p "$CONFIG_DIR"
     : > "$LOG_FILE"
 
-    fluidsynth -ni "$SELECTED_SOUNDFONT" "$SELECTED_MIDI" >"$LOG_FILE" 2>&1 &
+    if ! PLAYBACK_MIDI="$(prepare_speed_midi "$SELECTED_MIDI" "$CONFIG_DIR/playback-speed.mid")"; then
+        printf 'Could not prepare MIDI at %sx speed.\n' "$MIDI_SPEED"
+        pause
+        return
+    fi
+
+    fluidsynth -ni "$SELECTED_SOUNDFONT" "$PLAYBACK_MIDI" >"$LOG_FILE" 2>&1 &
     PLAYER_PID=$!
 
     sleep 0.2
     if player_is_running; then
         printf 'Playing: %s\n' "$(basename "$SELECTED_MIDI")"
         printf 'SoundFont: %s\n' "$(basename "$SELECTED_SOUNDFONT")"
+        printf 'Speed: %sx\n' "$MIDI_SPEED"
     else
         wait "$PLAYER_PID" 2>/dev/null || true
         PLAYER_PID=""
@@ -446,18 +542,24 @@ unique_output_path() {
 }
 
 render_selected() {
-    local midi_stem sf_stem output status
+    local midi_stem sf_stem output status render_midi
     require_selection || { pause; return; }
 
     midi_stem="$(safe_stem "$(basename "$SELECTED_MIDI")")"
     sf_stem="$(safe_stem "$(basename "$SELECTED_SOUNDFONT")")"
     output="$(unique_output_path "$midi_stem - $sf_stem" wav)"
 
-    clear_screen
-    printf 'Rendering:\n  MIDI: %s\n  SoundFont: %s\n  Output: %s\n\n' \
-        "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$output"
+    render_midi="$(prepare_speed_midi "$SELECTED_MIDI" "$CONFIG_DIR/render-speed.mid")" || {
+        printf 'Could not prepare MIDI at %sx speed.\n' "$MIDI_SPEED"
+        pause
+        return
+    }
 
-    fluidsynth -ni -T wav -F "$output" "$SELECTED_SOUNDFONT" "$SELECTED_MIDI"
+    clear_screen
+    printf 'Rendering:\n  MIDI: %s\n  SoundFont: %s\n  Speed: %sx\n  Output: %s\n\n' \
+        "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$MIDI_SPEED" "$output"
+
+    fluidsynth -ni -T wav -F "$output" "$SELECTED_SOUNDFONT" "$render_midi"
     status=$?
 
     if ((status == 0)) && [[ -s "$output" ]]; then
@@ -470,7 +572,7 @@ render_selected() {
 }
 
 render_selected_mp3() {
-    local midi_stem sf_stem output temp_dir temp_wav render_status encode_status
+    local midi_stem sf_stem output temp_dir temp_wav render_status encode_status render_midi
     require_selection || { pause; return; }
 
     if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -489,11 +591,18 @@ render_selected_mp3() {
     }
     temp_wav="$temp_dir/render.wav"
 
-    clear_screen
-    printf 'Rendering MP3:\n  MIDI: %s\n  SoundFont: %s\n  Output: %s\n\n' \
-        "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$output"
+    render_midi="$(prepare_speed_midi "$SELECTED_MIDI" "$CONFIG_DIR/render-speed.mid")" || {
+        rm -rf "$temp_dir"
+        printf 'Could not prepare MIDI at %sx speed.\n' "$MIDI_SPEED"
+        pause
+        return
+    }
 
-    fluidsynth -ni -T wav -F "$temp_wav" "$SELECTED_SOUNDFONT" "$SELECTED_MIDI"
+    clear_screen
+    printf 'Rendering MP3:\n  MIDI: %s\n  SoundFont: %s\n  Speed: %sx\n  Output: %s\n\n' \
+        "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$MIDI_SPEED" "$output"
+
+    fluidsynth -ni -T wav -F "$temp_wav" "$SELECTED_SOUNDFONT" "$render_midi"
     render_status=$?
 
     if ((render_status != 0)) || [[ ! -s "$temp_wav" ]]; then
@@ -549,6 +658,7 @@ show_status() {
     printf '\nSelected MIDI:      %s\n' "${SELECTED_MIDI:-None}"
     printf 'Selected SoundFont: %s\n' "${SELECTED_SOUNDFONT:-None}"
     printf 'SoundFont slots:   A=%s | B=%s | C=%s\n' "${SOUNDFONT_A:+Loaded}" "${SOUNDFONT_B:+Loaded}" "${SOUNDFONT_C:+Loaded}"
+    printf 'Playback speed:     %sx\n' "$MIDI_SPEED"
     printf 'Playback:           %s\n' "$playback"
 }
 
@@ -577,7 +687,9 @@ main_menu() {
         printf '7. Choose a random MIDI\n'
         printf '8. Change folders\n'
         printf '9. SoundFont workspace\n'
-        printf '10. Exit\n\n'
+        printf '10. Inspect selected MIDI\n'
+        printf '11. Change MIDI speed\n'
+        printf '12. Exit\n\n'
         printf 'Choose an option: '
         IFS= read -r choice
 
@@ -591,7 +703,9 @@ main_menu() {
             7) choose_random_midi ;;
             8) configure_folders ;;
             9) soundfont_workspace ;;
-            10) break ;;
+            10) inspect_selected_midi ;;
+            11) set_midi_speed ;;
+            12) break ;;
             *) printf 'Invalid option.\n'; pause ;;
         esac
     done
