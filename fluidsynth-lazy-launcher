@@ -14,6 +14,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MIDI_TOOL="$SCRIPT_DIR/midi-tools.py"
 MIDI_SPEED="1.00"
 PLAYBACK_MIDI=""
+PREPARED_MIDI=""
+PREPARED_MODE="plain"
+FLUIDSYNTH_SF_ARGS=()
+MIDI_BANK_ARGS=()
 
 MIDI_DIR=""
 SOUNDFONT_DIR=""
@@ -440,6 +444,36 @@ prepare_speed_midi() {
     return 1
 }
 
+
+instrument_reassignment() {
+    local result_file="$CONFIG_DIR/reassignment-result"
+    require_midi || { pause; return; }
+    mkdir -p "$CONFIG_DIR"
+    rm -f "$result_file"
+    clear_screen
+    python3 "$MIDI_TOOL" assign-interactive "$SELECTED_MIDI" "$OUTPUT_DIR" \
+        --slot-a "$SOUNDFONT_A" --slot-b "$SOUNDFONT_B" --slot-c "$SOUNDFONT_C" \
+        --result-file "$result_file"
+    if [[ -s "$result_file" ]]; then
+        SELECTED_MIDI="$(cat "$result_file")"
+        printf '\nThe saved reassigned MIDI is now selected.\n'
+    fi
+    pause
+}
+
+prepare_mapped_midi() {
+    local source="$1" target="$2"
+    local -a prepared=()
+    mapfile -t prepared < <(python3 "$MIDI_TOOL" prepare-playback "$source" "$target" "$SELECTED_SOUNDFONT") || return 1
+    ((${#prepared[@]} >= 3)) || return 1
+    PREPARED_MODE="${prepared[0]}"
+    PREPARED_MIDI="${prepared[1]}"
+    FLUIDSYNTH_SF_ARGS=("${prepared[@]:2}")
+    MIDI_BANK_ARGS=()
+    [[ "$PREPARED_MODE" == "mapped" ]] && MIDI_BANK_ARGS=(-o synth.midi-bank-select=mma)
+    return 0
+}
+
 player_is_running() {
     local _pid _comm state _rest
 
@@ -497,13 +531,18 @@ play_selected() {
     mkdir -p "$CONFIG_DIR"
     : > "$LOG_FILE"
 
-    if ! PLAYBACK_MIDI="$(prepare_speed_midi "$SELECTED_MIDI" "$CONFIG_DIR/playback-speed.mid")"; then
+    if ! prepare_mapped_midi "$SELECTED_MIDI" "$CONFIG_DIR/playback-assigned.mid"; then
+        printf 'Could not prepare instrument assignments.\n'
+        pause
+        return
+    fi
+    if ! PLAYBACK_MIDI="$(prepare_speed_midi "$PREPARED_MIDI" "$CONFIG_DIR/playback-speed.mid")"; then
         printf 'Could not prepare MIDI at %sx speed.\n' "$MIDI_SPEED"
         pause
         return
     fi
 
-    fluidsynth -ni "$SELECTED_SOUNDFONT" "$PLAYBACK_MIDI" >"$LOG_FILE" 2>&1 &
+    fluidsynth -ni "${MIDI_BANK_ARGS[@]}" "${FLUIDSYNTH_SF_ARGS[@]}" "$PLAYBACK_MIDI" >"$LOG_FILE" 2>&1 &
     PLAYER_PID=$!
 
     sleep 0.2
@@ -549,7 +588,12 @@ render_selected() {
     sf_stem="$(safe_stem "$(basename "$SELECTED_SOUNDFONT")")"
     output="$(unique_output_path "$midi_stem - $sf_stem" wav)"
 
-    render_midi="$(prepare_speed_midi "$SELECTED_MIDI" "$CONFIG_DIR/render-speed.mid")" || {
+    if ! prepare_mapped_midi "$SELECTED_MIDI" "$CONFIG_DIR/render-assigned.mid"; then
+        printf 'Could not prepare instrument assignments.\n'
+        pause
+        return
+    fi
+    render_midi="$(prepare_speed_midi "$PREPARED_MIDI" "$CONFIG_DIR/render-speed.mid")" || {
         printf 'Could not prepare MIDI at %sx speed.\n' "$MIDI_SPEED"
         pause
         return
@@ -559,7 +603,7 @@ render_selected() {
     printf 'Rendering:\n  MIDI: %s\n  SoundFont: %s\n  Speed: %sx\n  Output: %s\n\n' \
         "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$MIDI_SPEED" "$output"
 
-    fluidsynth -ni -T wav -F "$output" "$SELECTED_SOUNDFONT" "$render_midi"
+    fluidsynth -ni "${MIDI_BANK_ARGS[@]}" -T wav -F "$output" "${FLUIDSYNTH_SF_ARGS[@]}" "$render_midi"
     status=$?
 
     if ((status == 0)) && [[ -s "$output" ]]; then
@@ -591,7 +635,13 @@ render_selected_mp3() {
     }
     temp_wav="$temp_dir/render.wav"
 
-    render_midi="$(prepare_speed_midi "$SELECTED_MIDI" "$CONFIG_DIR/render-speed.mid")" || {
+    if ! prepare_mapped_midi "$SELECTED_MIDI" "$CONFIG_DIR/render-assigned.mid"; then
+        rm -rf "$temp_dir"
+        printf 'Could not prepare instrument assignments.\n'
+        pause
+        return
+    fi
+    render_midi="$(prepare_speed_midi "$PREPARED_MIDI" "$CONFIG_DIR/render-speed.mid")" || {
         rm -rf "$temp_dir"
         printf 'Could not prepare MIDI at %sx speed.\n' "$MIDI_SPEED"
         pause
@@ -602,7 +652,7 @@ render_selected_mp3() {
     printf 'Rendering MP3:\n  MIDI: %s\n  SoundFont: %s\n  Speed: %sx\n  Output: %s\n\n' \
         "$SELECTED_MIDI" "$SELECTED_SOUNDFONT" "$MIDI_SPEED" "$output"
 
-    fluidsynth -ni -T wav -F "$temp_wav" "$SELECTED_SOUNDFONT" "$render_midi"
+    fluidsynth -ni "${MIDI_BANK_ARGS[@]}" -T wav -F "$temp_wav" "${FLUIDSYNTH_SF_ARGS[@]}" "$render_midi"
     render_status=$?
 
     if ((render_status != 0)) || [[ ! -s "$temp_wav" ]]; then
@@ -689,7 +739,8 @@ main_menu() {
         printf '9. SoundFont workspace\n'
         printf '10. Inspect selected MIDI\n'
         printf '11. Change MIDI speed\n'
-        printf '12. Exit\n\n'
+        printf '12. Reassign MIDI instruments\n'
+        printf '13. Exit\n\n'
         printf 'Choose an option: '
         IFS= read -r choice
 
@@ -705,7 +756,8 @@ main_menu() {
             9) soundfont_workspace ;;
             10) inspect_selected_midi ;;
             11) set_midi_speed ;;
-            12) break ;;
+            12) instrument_reassignment ;;
+            13) break ;;
             *) printf 'Invalid option.\n'; pause ;;
         esac
     done
