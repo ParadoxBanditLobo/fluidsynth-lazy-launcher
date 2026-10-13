@@ -165,6 +165,155 @@ def speed_copy(src, dst, speed):
         out.extend(b'MTrk'); out.extend(len(rebuilt).to_bytes(4,'big')); out.extend(rebuilt)
     Path(dst).write_bytes(out); return changed
 
+
+def encode_vlq(value):
+    if value < 0:
+        raise ValueError('Negative variable-length value')
+    out=[value & 0x7f]
+    value >>= 7
+    while value:
+        out.append(0x80 | (value & 0x7f))
+        value >>= 7
+    return bytes(reversed(out))
+
+def channel_summary(info):
+    rows=[]
+    for ch in info['channels']:
+        latest=None
+        for t in info['tracks']:
+            for tick,c,p in t['programs']:
+                if c == ch and (latest is None or tick >= latest[0]):
+                    latest=(tick,p)
+        p = latest[1] if latest else 0
+        rows.append((ch,p))
+    return rows
+
+def print_channels(info):
+    for ch,p in channel_summary(info):
+        label='Percussion' if ch == 9 else GM_NAMES[p]
+        print(f'{ch+1}|{p+1}|{label}')
+
+def track_uses_channel(track, target):
+    info=parse_track(track, 480)
+    return target in info['channels']
+
+def reassign_copy(src, dst, channel, bank, program):
+    if not (0 <= channel <= 15):
+        raise ValueError('Channel must be 1-16')
+    if not (0 <= bank <= 16383):
+        raise ValueError('Bank must be 0-16383')
+    if not (0 <= program <= 127):
+        raise ValueError('Program must be 1-128')
+
+    data=Path(src).read_bytes()
+    _, ntrks, division, start=parse_header(data)
+    out=bytearray(data[:start])
+    injected=False
+    changed=0
+
+    for _, _, _, _, body in iter_tracks(data,start,ntrks):
+        body=bytes(body)
+        uses=track_uses_channel(body,channel)
+        pos=0
+        running=None
+        events=[]
+        while pos < len(body):
+            delta, pos, _ = read_vlq(body,pos)
+            if pos >= len(body):
+                break
+            status=body[pos]
+            if status < 0x80:
+                if running is None:
+                    raise ValueError('Invalid running status')
+                eff=status if False else running
+                explicit=False
+            else:
+                pos+=1
+                eff=status
+                explicit=True
+                if 0x80 <= eff <= 0xEF:
+                    running=eff
+                else:
+                    running=None
+
+            if eff == 0xFF:
+                if pos >= len(body):
+                    raise ValueError('Truncated meta event')
+                meta_type=body[pos]; pos+=1
+                length,payload_start,_=read_vlq(body,pos)
+                payload_end=payload_start+length
+                if payload_end>len(body):
+                    raise ValueError('Truncated meta event')
+                raw=bytes([0xFF,meta_type])+encode_vlq(length)+body[payload_start:payload_end]
+                pos=payload_end
+                events.append([delta,raw,False])
+            elif eff in (0xF0,0xF7):
+                length,payload_start,_=read_vlq(body,pos)
+                payload_end=payload_start+length
+                if payload_end>len(body):
+                    raise ValueError('Truncated SysEx event')
+                raw=bytes([eff])+encode_vlq(length)+body[payload_start:payload_end]
+                pos=payload_end
+                events.append([delta,raw,False])
+            elif 0x80 <= eff <= 0xEF:
+                ch=eff & 0x0F
+                kind=eff & 0xF0
+                need=1 if kind in (0xC0,0xD0) else 2
+                if pos+need>len(body):
+                    raise ValueError('Truncated channel event')
+                payload=body[pos:pos+need]; pos+=need
+                skip=False
+                if ch == channel:
+                    if kind == 0xC0:
+                        skip=True
+                    elif kind == 0xB0 and payload[0] in (0,32):
+                        skip=True
+                if skip:
+                    changed+=1
+                    if events:
+                        events[-1][0]+=delta
+                    else:
+                        events.append([delta,b'',True])
+                else:
+                    events.append([delta,bytes([eff])+payload,False])
+            else:
+                raise ValueError(f'Unsupported status byte 0x{eff:02X}')
+
+        if uses and not injected:
+            bank_msb=(bank >> 7) & 0x7f
+            bank_lsb=bank & 0x7f
+            setup=[
+                bytes([0xB0|channel,0,bank_msb]),
+                bytes([0xB0|channel,32,bank_lsb]),
+                bytes([0xC0|channel,program])
+            ]
+            prefix=bytearray()
+            for raw in setup:
+                prefix.extend(b'\x00'); prefix.extend(raw)
+            rebuilt=bytearray(prefix)
+            injected=True
+        else:
+            rebuilt=bytearray()
+
+        pending=0
+        for delta,raw,placeholder in events:
+            pending += delta
+            if placeholder or not raw:
+                continue
+            rebuilt.extend(encode_vlq(pending)); rebuilt.extend(raw); pending=0
+        if pending:
+            rebuilt.extend(encode_vlq(pending)); rebuilt.extend(b'\xff\x2f\x00')
+
+        out.extend(b'MTrk')
+        out.extend(len(rebuilt).to_bytes(4,'big'))
+        out.extend(rebuilt)
+
+    if not injected:
+        raise ValueError(f'Channel {channel+1} is not used by this MIDI')
+    Path(dst).write_bytes(out)
+    return changed + 3
+
+
 def format_seconds(sec):
     sec=max(0,int(round(sec))); m,s=divmod(sec,60); h,m=divmod(m,60)
     return f'{h:d}:{m:02d}:{s:02d}' if h else f'{m:d}:{s:02d}'
@@ -198,12 +347,19 @@ def main():
     sub=ap.add_subparsers(dest='cmd',required=True)
     p=sub.add_parser('inspect'); p.add_argument('midi'); p.add_argument('--json',action='store_true')
     p=sub.add_parser('speed'); p.add_argument('input'); p.add_argument('output'); p.add_argument('multiplier',type=float)
+    p=sub.add_parser('channels'); p.add_argument('midi')
+    p=sub.add_parser('reassign'); p.add_argument('input'); p.add_argument('output'); p.add_argument('channel',type=int); p.add_argument('bank',type=int); p.add_argument('program',type=int)
     args=ap.parse_args()
     try:
         if args.cmd=='inspect':
             info=inspect(args.midi)
             print(json.dumps(info,indent=2) if args.json else '',end='') if args.json else print_text(info)
-        else: print(speed_copy(args.input,args.output,args.multiplier))
+        elif args.cmd=='speed':
+            print(speed_copy(args.input,args.output,args.multiplier))
+        elif args.cmd=='channels':
+            print_channels(inspect(args.midi))
+        elif args.cmd=='reassign':
+            print(reassign_copy(args.input,args.output,args.channel-1,args.bank,args.program-1))
     except Exception as e:
         print(f'Error: {e}',file=sys.stderr); sys.exit(1)
 if __name__=='__main__': main()
