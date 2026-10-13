@@ -382,7 +382,7 @@ def apply_assignments(src,dst,assignments,offsets=False):
                 try: Path(p).unlink()
                 except FileNotFoundError: pass
 
-def interactive_assign(midi,outdir,slots):
+def interactive_assign(midi,outdir,slots,result_file=''):
     info=inspect(midi)
     channels=channel_summary(info)
     used={c+1 for c,_ in channels}
@@ -437,7 +437,9 @@ def interactive_assign(midi,outdir,slots):
             apply_assignments(midi,out,ordered,offsets=False)
             sidecar=Path(str(out)+'.fslmap')
             sidecar.write_text(json.dumps({'version':1,'assignments':ordered},indent=2),encoding='utf-8')
-            print('SAVED:'+str(out))
+            if result_file:
+                Path(result_file).write_text(str(out),encoding='utf-8')
+            print('Saved modified MIDI:',out)
             return 0
         elif choice=='4':
             return 1
@@ -473,7 +475,7 @@ def main():
     p=sub.add_parser('speed'); p.add_argument('input'); p.add_argument('output'); p.add_argument('multiplier',type=float)
     p=sub.add_parser('channels'); p.add_argument('midi')
     p=sub.add_parser('reassign'); p.add_argument('input'); p.add_argument('output'); p.add_argument('channel',type=int); p.add_argument('bank',type=int); p.add_argument('program',type=int)
-    p=sub.add_parser('assign-interactive'); p.add_argument('midi'); p.add_argument('outdir'); p.add_argument('--slot-a',default=''); p.add_argument('--slot-b',default=''); p.add_argument('--slot-c',default='')
+    p=sub.add_parser('assign-interactive'); p.add_argument('midi'); p.add_argument('outdir'); p.add_argument('--slot-a',default=''); p.add_argument('--slot-b',default=''); p.add_argument('--slot-c',default=''); p.add_argument('--result-file',default='')
     p=sub.add_parser('prepare-playback'); p.add_argument('midi'); p.add_argument('target'); p.add_argument('selected_sf')
     args=ap.parse_args()
     try:
@@ -487,7 +489,7 @@ def main():
         elif args.cmd=='reassign':
             print(reassign_copy(args.input,args.output,args.channel-1,args.bank,args.program-1))
         elif args.cmd=='assign-interactive':
-            raise SystemExit(interactive_assign(args.midi,args.outdir,{'A':args.slot_a,'B':args.slot_b,'C':args.slot_c}))
+            raise SystemExit(interactive_assign(args.midi,args.outdir,{'A':args.slot_a,'B':args.slot_b,'C':args.slot_c},args.result_file))
         elif args.cmd=='prepare-playback':
             prepare_playback(args.midi,args.target,args.selected_sf)
     except Exception as e:
