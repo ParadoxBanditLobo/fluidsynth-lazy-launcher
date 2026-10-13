@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, struct, sys
+import argparse, json, struct, sys, subprocess, time, shutil
 from pathlib import Path
 
 GM_NAMES = [
@@ -342,6 +342,130 @@ def print_text(info):
                 if item not in seen: seen.append(item)
             print('    Programs: '+', '.join(seen[:8]))
 
+
+SLOT_OFFSETS={'A':256,'B':512,'C':768}
+
+def list_soundfont_presets(sf):
+    proc=subprocess.run(['fluidsynth','-n',sf],input='fonts\nquit\n',text=True,capture_output=True)
+    sfid=1
+    for line in proc.stdout.splitlines():
+        parts=line.strip().split(None,1)
+        if len(parts)==2 and parts[0].isdigit():
+            sfid=int(parts[0]); break
+    proc=subprocess.run(['fluidsynth','-n',sf],input=f'inst {sfid}\nquit\n',text=True,capture_output=True)
+    rows=[]
+    for line in proc.stdout.splitlines():
+        s=line.strip()
+        if '-' not in s: continue
+        first,*rest=s.split(None,1)
+        if not rest or '-' not in first: continue
+        a,b=first.split('-',1)
+        if a.isdigit() and b.isdigit():
+            rows.append((int(a),int(b),rest[0].strip()))
+    return rows
+
+def apply_assignments(src,dst,assignments,offsets=False):
+    current=Path(src)
+    temp_paths=[]
+    try:
+        for i,a in enumerate(assignments):
+            out=Path(str(dst)+f'.stage{i}')
+            bank=int(a['bank']) + (SLOT_OFFSETS[a['slot']] if offsets else 0)
+            reassign_copy(current,out,int(a['channel'])-1,bank,int(a['program']))
+            if current != Path(src):
+                temp_paths.append(current)
+            current=out
+        shutil.copyfile(current,dst)
+    finally:
+        for p in temp_paths+[current]:
+            if p != Path(src) and p != Path(dst):
+                try: Path(p).unlink()
+                except FileNotFoundError: pass
+
+def interactive_assign(midi,outdir,slots):
+    info=inspect(midi)
+    channels=channel_summary(info)
+    used={c+1 for c,_ in channels}
+    assignments={}
+    while True:
+        print('\nInstrument Reassignment')
+        print('=======================')
+        print('MIDI:',Path(midi).name)
+        print('\nChannels:')
+        for ch,p in channels:
+            label='Percussion' if ch==9 else GM_NAMES[p]
+            active=assignments.get(ch+1)
+            extra=f" -> slot {active['slot']} / {active['name']}" if active else ''
+            print(f'  {ch+1:2d}. {label} (program {p+1}){extra}')
+        print('\n1. Assign channel')
+        print('2. Clear channel assignment')
+        print('3. Save modified MIDI')
+        print('4. Cancel')
+        choice=input('\nChoose an option: ').strip()
+        if choice=='1':
+            try: ch=int(input('Channel (1-16): ').strip())
+            except ValueError: print('Invalid channel.'); continue
+            if ch not in used: print('That channel is not used by this MIDI.'); continue
+            slot=input('SoundFont slot (A/B/C): ').strip().upper()
+            sf=slots.get(slot)
+            if slot not in ('A','B','C') or not sf or not Path(sf).is_file():
+                print('That SoundFont slot is empty.'); continue
+            presets=list_soundfont_presets(sf)
+            if not presets: print('No presets could be read from that SoundFont.'); continue
+            print(f'\nPresets in slot {slot}:')
+            for i,(bank,program,name) in enumerate(presets,1):
+                print(f'{i:3d}. bank {bank:3d}  program {program:3d}  {name}')
+            try: pick=int(input('Preset number (0 cancels): ').strip())
+            except ValueError: print('Invalid preset.'); continue
+            if pick==0: continue
+            if not 1 <= pick <= len(presets): print('Invalid preset.'); continue
+            bank,program,name=presets[pick-1]
+            assignments[ch]={'channel':ch,'slot':slot,'bank':bank,'program':program,'name':name,'soundfont':sf}
+        elif choice=='2':
+            try: ch=int(input('Channel to clear: ').strip())
+            except ValueError: continue
+            assignments.pop(ch,None)
+        elif choice=='3':
+            if not assignments:
+                print('No assignments to save.'); continue
+            stem=Path(midi).stem+' - reassigned'
+            outdir=Path(outdir); outdir.mkdir(parents=True,exist_ok=True)
+            out=outdir/(stem+'.mid'); counter=2
+            while out.exists():
+                out=outdir/(f'{stem} ({counter}).mid'); counter+=1
+            ordered=[assignments[k] for k in sorted(assignments)]
+            apply_assignments(midi,out,ordered,offsets=False)
+            sidecar=Path(str(out)+'.fslmap')
+            sidecar.write_text(json.dumps({'version':1,'assignments':ordered},indent=2),encoding='utf-8')
+            print('SAVED:'+str(out))
+            return 0
+        elif choice=='4':
+            return 1
+        else:
+            print('Invalid option.')
+
+def prepare_playback(midi,target,selected_sf):
+    sidecar=Path(str(midi)+'.fslmap')
+    if not sidecar.is_file():
+        print('plain'); print(midi); print(selected_sf); return
+    data=json.loads(sidecar.read_text(encoding='utf-8'))
+    assignments=data.get('assignments',[])
+    if not assignments:
+        print('plain'); print(midi); print(selected_sf); return
+    help_text=subprocess.run(['fluidsynth','--help'],text=True,capture_output=True).stdout
+    if '--bank-offset' not in help_text:
+        raise ValueError('Mapped multi-SoundFont playback requires FluidSynth 2.5.0 or newer')
+    apply_assignments(midi,target,assignments,offsets=True)
+    print('mapped'); print(target)
+    if selected_sf and Path(selected_sf).is_file():
+        print('-b'); print('0'); print(selected_sf)
+    seen=set()
+    for a in assignments:
+        slot=a['slot']; sf=a.get('soundfont','')
+        if slot in seen or not sf or not Path(sf).is_file(): continue
+        seen.add(slot)
+        print('-b'); print(str(SLOT_OFFSETS[slot])); print(sf)
+
 def main():
     ap=argparse.ArgumentParser()
     sub=ap.add_subparsers(dest='cmd',required=True)
@@ -349,6 +473,8 @@ def main():
     p=sub.add_parser('speed'); p.add_argument('input'); p.add_argument('output'); p.add_argument('multiplier',type=float)
     p=sub.add_parser('channels'); p.add_argument('midi')
     p=sub.add_parser('reassign'); p.add_argument('input'); p.add_argument('output'); p.add_argument('channel',type=int); p.add_argument('bank',type=int); p.add_argument('program',type=int)
+    p=sub.add_parser('assign-interactive'); p.add_argument('midi'); p.add_argument('outdir'); p.add_argument('--slot-a',default=''); p.add_argument('--slot-b',default=''); p.add_argument('--slot-c',default='')
+    p=sub.add_parser('prepare-playback'); p.add_argument('midi'); p.add_argument('target'); p.add_argument('selected_sf')
     args=ap.parse_args()
     try:
         if args.cmd=='inspect':
@@ -360,6 +486,10 @@ def main():
             print_channels(inspect(args.midi))
         elif args.cmd=='reassign':
             print(reassign_copy(args.input,args.output,args.channel-1,args.bank,args.program-1))
+        elif args.cmd=='assign-interactive':
+            raise SystemExit(interactive_assign(args.midi,args.outdir,{'A':args.slot_a,'B':args.slot_b,'C':args.slot_c}))
+        elif args.cmd=='prepare-playback':
+            prepare_playback(args.midi,args.target,args.selected_sf)
     except Exception as e:
         print(f'Error: {e}',file=sys.stderr); sys.exit(1)
 if __name__=='__main__': main()
